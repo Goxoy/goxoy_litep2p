@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["Omer GOKSOY <goksoy.omer@gmail.com>"]
 description = "Goxoy Lite P2P Library"
 license = "MIT"
-keywords = ["p2p","peer-2-peer2","lite p2p"]
+keywords = ["p2p","peer-2-peer2","lite-p2p"]
 #rust-version ="1.66.1"
 repository = "https://github.com/Goxoy/goxoy_litep2p/"
 
