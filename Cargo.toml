@@ -7,7 +7,7 @@ description = "Goxoy Lite P2P Library"
 license = "MIT"
 keywords = ["p2p","peer-2-peer2","lite p2p"]
 #rust-version ="1.66.1"
-repository = "https://github.com/Goxoy/goxoy-socket-client/"
+repository = "https://github.com/Goxoy/goxoy_litep2p/"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
