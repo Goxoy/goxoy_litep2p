@@ -1,6 +1,5 @@
 use colored::Colorize;
 use config::Config;
-use helper::client_async;
 use log::{debug, error, info, trace};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -8,10 +7,11 @@ use std::{
     net::TcpListener,
     sync::{Arc, Mutex},
     thread,
+    time::Duration,
 };
 use structs::{
-    ConvertVecToStruct, Message, MessageKind, NodeDetails, NodeDetailsToHelper, NodeStatus,
-    StateType,
+    ConvertVecToStruct, Message, MessageKind, NodeDetails, NodeDetailsArcExtension, NodeStatus,
+    StateType, VecStringArcExtension,
 };
 use worker::ThreadPool;
 
@@ -31,6 +31,7 @@ pub struct MessagePool {
     node_hash: Arc<Mutex<String>>,
     node_list_synced: Arc<Mutex<String>>,
     node_hash_updated: Arc<Mutex<bool>>,
+    offline_node_list: Arc<Mutex<Vec<String>>>,
     node_status_change: Arc<Mutex<Vec<(String, NodeStatus)>>>,
     node_list: Arc<Mutex<Vec<NodeDetails>>>,
     msg_list: Arc<Mutex<Vec<Message>>>,
@@ -54,6 +55,7 @@ impl MessagePool {
             node_status_change: Arc::new(Mutex::new(Vec::new())),
             node_list: Arc::new(Mutex::new(Vec::new())),
             msg_list: Arc::new(Mutex::new(Vec::new())),
+            offline_node_list: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -101,13 +103,16 @@ impl MessagePool {
     fn process_state(&mut self, income_msg: Message) {
         match income_msg.payload.to_state_struct() {
             StateType::Unknown() => {
-                println!("hatali state geldi");
+                error!("Unknown-State");
             }
             StateType::Ping(income_node_list_hash) => {
                 trace!("Ping Msg Arrived");
                 self.add_node_to_list(income_msg.sender.clone());
                 if self.store_node_list_active == true {
-                    self.node_list.store_to_disk(self.my_addr.clone());
+                    self.node_list.store_to_disk(
+                        self.my_addr.clone(),
+                        self.offline_node_list.lock().unwrap().clone(),
+                    );
                 }
 
                 let new_node_hash = self.node_list.calculate_hash();
@@ -124,13 +129,8 @@ impl MessagePool {
                 *self.node_hash.lock().unwrap() = self.node_list.calculate_hash();
             }
             StateType::ControlNodeStatus(new_status_node_addr) => {
-                // println!("node durumu değişti -> {}", new_status_node_addr.clone());
-                for node_info in self.node_list.lock().unwrap().iter_mut() {
-                    if node_info.addr.eq(&new_status_node_addr) {
-                        node_info.last_access_time = 0;
-                        break;
-                    }
-                }
+                self.node_list
+                    .set_last_access_time(new_status_node_addr.clone(), 0);
             }
             StateType::NodeList(income_node_list) => {
                 trace!("Node List Arrived");
@@ -138,7 +138,10 @@ impl MessagePool {
                     *self.node_hash.lock().unwrap() = self.node_list.calculate_hash();
                     *self.node_hash_updated.lock().unwrap() = false;
                     if self.store_node_list_active == true {
-                        self.node_list.store_to_disk(self.my_addr.clone());
+                        self.node_list.store_to_disk(
+                            self.my_addr.clone(),
+                            self.offline_node_list.lock().unwrap().clone(),
+                        );
                     }
                     trace!("Send Node List To =>{}", income_msg.sender.clone());
                 } else {
@@ -147,6 +150,7 @@ impl MessagePool {
             }
         }
     }
+
     pub fn get_message(&mut self) -> Message {
         let income_msg = self.msg_list.lock().unwrap()[0].clone();
         self.dispose_message();
@@ -220,6 +224,7 @@ impl MessagePool {
                     n_list_hash.clone(),
                     self.node_list.online_node_count()
                 );
+
                 return EventType::OnNodesSynced(n_list_hash.clone());
             }
         }
@@ -286,15 +291,15 @@ impl MessagePool {
         let node_hash_updated = self.node_hash_updated.clone();
         let node_list_synced = self.node_list_synced.clone();
         let hard_config_ping_time = self.hard_config.ping_time;
+        let offline_node_list = self.offline_node_list.clone();
+
         thread::spawn(move || {
             let mut all_node_list_changed = true;
             let mut ping_time_diff = 0;
             loop {
                 let mut next_ping_time_diff = hard_config_ping_time;
                 let mut update_node_hash_value = false;
-                let mut update_node_status = Vec::new();
-                let mut update_time = Vec::new();
-                let mut move_to_offline_node = usize::MAX;
+
                 let sending_data = Message {
                     id: helper::get_sys_time_in_nano(),
                     sender: my_node_addr.clone(),
@@ -303,183 +308,157 @@ impl MessagePool {
                         .to_byte_array(),
                 }
                 .to_byte_array();
+
                 let tmp_node_list = node_list.lock().unwrap().clone();
-                for (n_index, n_info) in tmp_node_list.iter().enumerate() {
-                    if move_to_offline_node == usize::MAX
-                        && my_node_addr.eq(&n_info.addr.clone()) == false
-                    {
-                        let send_ping_to_node = match n_info.status {
-                            NodeStatus::Online => {
-                                let curr_millis = helper::get_sys_time_in_millis();
-                                let time_diff = n_info.last_access_time.abs_diff(curr_millis);
-                                if time_diff > ping_time_diff {
-                                    true
-                                } else {
-                                    false
-                                }
+
+                for (_n_index, n_info) in tmp_node_list.iter().enumerate() {
+                    if my_node_addr.eq(&n_info.addr.clone()) == true {
+                        continue;
+                    }
+                    // let (send_ping_to_node,new_ping_time) =n_info.check_status_for_ping(next_ping_time_diff);
+                    // next_ping_time_diff=new_ping_time;
+                    let send_ping_to_node = match n_info.status {
+                        NodeStatus::Online => {
+                            if n_info
+                                .last_access_time
+                                .abs_diff(helper::get_sys_time_in_millis())
+                                > ping_time_diff
+                            {
+                                trace!(
+                                    "{}   => {} [{}]",
+                                    n_info.addr.clone(),
+                                    "testing ONLINE",
+                                    ping_time_diff
+                                );
+                                true
+                            } else {
+                                false
                             }
-                            NodeStatus::Offline => {
-                                let current_time = helper::get_sys_time_in_secs();
-                                if current_time.abs_diff(n_info.last_access_time) > 10 {
-                                    // TO-DO
-                                    // eğer kontrol edildiği zaman yine offline ise,
-                                    // bu listeden çıkartıp offline listesine al
-                                    debug!("{}   => {}", n_info.addr.clone(), "testing offline");
+                        }
+                        NodeStatus::Offline => {
+                            if n_info.testing_count > 2 {
+                                println!("offline - count > 2");
+                                false
+                            } else {
+                                if helper::get_sys_time_in_secs().abs_diff(n_info.last_access_time)
+                                    > 10
+                                {
+                                    debug!(
+                                        "{}   => {} [{}]",
+                                        n_info.addr.clone(),
+                                        "testing offline",
+                                        n_info.testing_count
+                                    );
                                     next_ping_time_diff = 0;
                                     true
                                 } else {
+                                    println!("offline - FALSE");
                                     false
                                 }
                             }
-                            NodeStatus::Unknown => {
-                                next_ping_time_diff = 0;
-                                debug!("{}   => {}", n_info.addr.clone(), "testing unknown");
-                                true
+                        }
+                        NodeStatus::Unknown => {
+                            next_ping_time_diff = 0;
+                            debug!("{}   => {}", n_info.addr.clone(), "testing unknown");
+                            true
+                        }
+                    };
+
+                    if send_ping_to_node == true {
+                        let result = helper::client(n_info.addr.to_string(), sending_data.clone());
+
+                        if result.kind == MessageKind::Ok {
+                            if n_info.testing_count != 0 {
+                                node_list.set_error_count(n_info.addr.clone(), 0);
                             }
-                        };
 
-                        if send_ping_to_node == true {
-                            let result =
-                                helper::client(n_info.addr.to_string(), sending_data.clone());
-                            if result.kind == MessageKind::Ok {
-                                update_time
-                                    .push((n_info.addr.clone(), helper::get_sys_time_in_millis()));
-                                if n_info.status != NodeStatus::Online {
-                                    update_node_status
-                                        .push((n_info.addr.clone(), NodeStatus::Online));
-                                    node_status_change
-                                        .lock()
-                                        .unwrap()
-                                        .push((n_info.addr.clone(), NodeStatus::Online));
-                                    update_node_hash_value = true;
-                                }
-                            } else {
-                                if result.id == 5 {
-                                    update_node_hash_value = true;
-                                    match n_info.status {
-                                        NodeStatus::Online => {
-                                            let offline_node_addr = n_info.addr.clone();
-                                            // println!("offline_node_addr: {}", offline_node_addr);
+                            if n_info.status != NodeStatus::Online {
+                                node_status_change
+                                    .lock()
+                                    .unwrap()
+                                    .push((n_info.addr.clone(), NodeStatus::Online));
+                                node_list.set_state(n_info.addr.clone(), NodeStatus::Online);
+                                update_node_hash_value = true;
+                            }
 
-                                            let state_msg_vec = Message {
-                                                id: helper::get_sys_time_in_nano(),
-                                                sender: my_node_addr.clone(),
-                                                kind: MessageKind::State,
-                                                payload: StateType::ControlNodeStatus(
-                                                    offline_node_addr.clone(),
-                                                )
-                                                .to_byte_array(),
-                                            }
-                                            .to_byte_array();
-                                            // omergoksoy
-                                            // burada online olan bir nodu'un offline olduğunu öğrendik
-                                            // bu durumu diğer nodelara state olarak iletiyoruz
-                                            for node_addr in node_list.to_node_list().iter() {
-                                                if node_addr.eq(&offline_node_addr.clone()) == false
-                                                    && node_addr.eq(&my_node_addr.clone()) == false
-                                                {
-                                                    // println!("node'u ilet => {}", helper::get_sys_time_in_nano() );
-                                                    client_async(
-                                                        node_addr.clone(),
-                                                        state_msg_vec.clone(),
-                                                    );
-                                                }
-                                            }
-                                            update_node_status.push((
-                                                offline_node_addr.clone(),
-                                                NodeStatus::Offline,
-                                            ));
-                                            node_status_change.lock().unwrap().push((
-                                                offline_node_addr.clone(),
-                                                NodeStatus::Offline,
-                                            ));
-                                        }
-                                        NodeStatus::Offline => {
-                                            move_to_offline_node = n_index.clone();
-                                        }
-                                        NodeStatus::Unknown => {
-                                            update_node_status
-                                                .push((n_info.addr.clone(), NodeStatus::Offline));
-                                            node_status_change
-                                                .lock()
-                                                .unwrap()
-                                                .push((n_info.addr.clone(), NodeStatus::Unknown));
-                                        }
-                                    }
-                                } else {
-                                    if result.id != 9 {
-                                        debug!("result: {:?}", result);
-                                    }
+                            node_list.set_last_access_time(
+                                n_info.addr.clone(),
+                                helper::get_sys_time_in_millis(),
+                            );
+                        }
+
+                        if result.kind == MessageKind::Error {
+                            println!("result.id : {} {}", n_info.addr.to_string(), result.id);
+                            let offline_node_addr = n_info.addr.clone();
+                            update_node_hash_value = true;
+                            all_node_list_changed = true;
+
+                            if n_info.testing_count == 0 {
+                                node_list.warn_the_others_about_offline_node(
+                                    my_node_addr.clone(),
+                                    offline_node_addr.clone(),
+                                );
+                                node_list.set_state(offline_node_addr.clone(), NodeStatus::Offline);
+                                node_list.set_error_count(n_info.addr.clone(), 1);
+                            }
+
+                            offline_node_list.insert_if_not_exist(n_info.addr.clone());
+                            node_list.remove_from_list(n_info.addr.clone());
+
+                            if n_info.status == NodeStatus::Online {
+                                node_status_change
+                                    .lock()
+                                    .unwrap()
+                                    .push((offline_node_addr.clone(), NodeStatus::Offline));
+                            }
+                        }
+                    }
+                }
+
+                // asenkron olduğu için aynı işlemi tekrar tekrar yapıyor
+                let mut update_sync_time = Vec::new();
+                let tmp_node_list = node_list.lock().unwrap().clone();
+                for n_info in tmp_node_list.iter() {
+                    if my_node_addr.eq(&n_info.addr.clone()) == false {
+                        if my_node_hash.lock().unwrap().eq(&n_info.node_hash) == false {
+                            if n_info.status == NodeStatus::Online {
+                                let time_diff =
+                                    helper::get_sys_time_in_millis() - n_info.synced_time_as_secs;
+                                if time_diff > 100 {
+                                    update_sync_time.push(n_info.addr.clone());
+                                    trace!(
+                                        "Sync With  [ {} ]  => {}",
+                                        time_diff,
+                                        n_info.addr.clone()
+                                    );
+
+                                    let my_node_list = node_list.to_node_list().clone();
+                                    node_list.send_state_to_all(
+                                        my_node_addr.clone(),
+                                        StateType::NodeList(my_node_list),
+                                    );
                                 }
                             }
                         }
                     }
                 }
 
-                if move_to_offline_node != usize::MAX {
-                    node_list.lock().unwrap().remove(move_to_offline_node);
-                    all_node_list_changed = true;
+                node_list
+                    .clone()
+                    .set_sync_time(update_sync_time, helper::get_sys_time_in_millis());
+
+                if helper::control_nodes_hash(node_list.lock().unwrap().clone()) {
+                    if all_node_list_changed == true {
+                        all_node_list_changed = false;
+                        let node_hash_cloned = my_node_hash.lock().unwrap().clone();
+                        let current_list_hash = node_list_synced.lock().unwrap().clone();
+                        if current_list_hash.eq(&node_hash_cloned.clone()) == false {
+                            *node_list_synced.lock().unwrap() = node_hash_cloned.clone();
+                            *node_hash_updated.lock().unwrap() = true;
+                        }
+                    }
                 } else {
-                    for (n_addr, n_time) in update_time.iter() {
-                        for n_info in node_list.lock().unwrap().iter_mut() {
-                            if n_info.addr.eq(n_addr) {
-                                n_info.last_access_time = n_time.clone();
-                            }
-                        }
-                    }
-
-                    for (o_node, n_status) in update_node_status.iter() {
-                        for n_info in node_list.lock().unwrap().iter_mut() {
-                            if n_info.addr.eq(o_node) {
-                                n_info.status = n_status.clone();
-                            }
-                        }
-                    }
-
-                    // asenkron olduğu için aynı işlemi tekrar tekrar yapıyor
-                    let mut update_sync_time = Vec::new();
-                    let tmp_node_list = node_list.lock().unwrap().clone();
-                    for n_info in tmp_node_list.iter() {
-                        if my_node_addr.eq(&n_info.addr.clone()) == false {
-                            if my_node_hash.lock().unwrap().eq(&n_info.node_hash) == false {
-                                if n_info.status == NodeStatus::Online {
-                                    let time_diff = helper::get_sys_time_in_millis()
-                                        - n_info.synced_time_as_secs;
-                                    if time_diff > 100 {
-                                        update_sync_time.push(n_info.addr.clone());
-                                        trace!(
-                                            "Sync With  [ {} ]  => {}",
-                                            time_diff,
-                                            n_info.addr.clone()
-                                        );
-
-                                        node_list.send_state_to_all(
-                                            my_node_addr.clone(),
-                                            StateType::NodeList(node_list.to_node_list()),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    node_list
-                        .clone()
-                        .set_sync_time(update_sync_time, helper::get_sys_time_in_millis());
-
-                    if helper::control_nodes_hash(node_list.lock().unwrap().clone()) {
-                        if all_node_list_changed == true {
-                            all_node_list_changed = false;
-                            let node_hash_cloned = my_node_hash.lock().unwrap().clone();
-                            let current_list_hash = node_list_synced.lock().unwrap().clone();
-                            if current_list_hash.eq(&node_hash_cloned.clone()) == false {
-                                *node_list_synced.lock().unwrap() = node_hash_cloned.clone();
-                                *node_hash_updated.lock().unwrap() = true;
-                            }
-                        }
-                    } else {
-                        all_node_list_changed = true;
-                    }
+                    all_node_list_changed = true;
                 }
 
                 if update_node_hash_value == true {
@@ -492,8 +471,9 @@ impl MessagePool {
                         == false
                     {
                         all_node_list_changed = true;
+                        *current_node_hash.lock().unwrap() = new_node_list_hash.clone();
                     }
-                    *current_node_hash.lock().unwrap() = new_node_list_hash.clone();
+
                     for n_info in node_list.lock().unwrap().iter_mut() {
                         if my_node_addr.eq(&n_info.addr.clone()) {
                             if n_info.node_hash.eq(&new_node_list_hash.clone()) == false {
@@ -507,7 +487,7 @@ impl MessagePool {
                 ping_time_diff = next_ping_time_diff;
 
                 if ping_time_diff > 0 {
-                    //thread::sleep(Duration::from_millis(50));
+                    thread::sleep(Duration::from_millis(50));
                 }
             }
         });
@@ -519,7 +499,7 @@ impl MessagePool {
             return false;
         }
         let listener = listener.unwrap();
-        let pool = ThreadPool::new(4);
+        let pool = ThreadPool::new(2);
         let msg_list_cloned = self.msg_list.clone();
         let my_addr = self.my_addr.clone();
         thread::spawn(move || loop {
@@ -582,8 +562,9 @@ impl MessagePool {
                 synced_time_as_secs: 0,
                 last_access_time: 0,
                 node_hash: String::new(),
+                testing_count: 0,
             });
-            self.node_list.clone().set_sync_time(Vec::new(), 0);
+            self.node_list.set_sync_time(Vec::new(), 0);
         }
         updated
     }

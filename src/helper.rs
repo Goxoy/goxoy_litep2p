@@ -10,13 +10,14 @@ pub fn control_nodes_hash(node_list: Vec<NodeDetails>) -> bool {
     let mut all_equal = true;
     let mut current_hash = String::new();
     for n_info in node_list.iter() {
-        if n_info.status == NodeStatus::Online {
-            if current_hash.len() == 0 {
-                current_hash = n_info.node_hash.clone();
-            }
-            if current_hash.eq(&n_info.node_hash) == false {
-                all_equal = false;
-            }
+        if n_info.status != NodeStatus::Online {
+            continue;
+        }
+        if current_hash.len() == 0 {
+            current_hash = n_info.node_hash.clone();
+        }
+        if current_hash.eq(&n_info.node_hash) == false {
+            all_equal = false;
         }
     }
     all_equal
@@ -33,7 +34,7 @@ pub fn client(node_addr: String, msg_data: Vec<u8>) -> Message {
     let mut result_no = 0;
     match TcpStream::connect(node_addr.clone()) {
         Ok(mut stream) => {
-            match stream.set_read_timeout(Some(Duration::from_millis(10))) {
+            match stream.set_read_timeout(Some(Duration::from_millis(100))) {
                 Ok(_) => {}
                 Err(_) => {}
             }
